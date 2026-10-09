@@ -206,7 +206,7 @@ export async function defineShellConfig(shellName: ShellName): Promise<UserConfi
     }
   }
 
-  validateShellManifest(shellName, shell, shellDir, internals, lookup);
+  validateShellManifest(shellName, shell, shellDir, repoRoot, internals, lookup);
 
   return defineConfig({
     entry,
@@ -409,11 +409,16 @@ function validateShellManifest(
   shellName: ShellName,
   shell: ShellDefinition,
   shellDir: string,
+  repoRoot: string,
   internals: readonly InternalPackage[],
   lookup: Map<string, InternalPackage>,
 ): void {
   const manifest = readJson(join(shellDir, 'package.json'));
-  const version = stringField(manifest, 'version', shellName);
+  // A forked public shell may carry a distinct package version while its
+  // runtime dependencies must remain pinned to the workspace release it
+  // extends. Sibling shell pins therefore come from the repository version,
+  // not the fork's own published version.
+  const version = stringField(readJson(join(repoRoot, 'package.json')), 'version', 'repository');
 
   const expectedDeps = new Map<string, string>();
   const expectedPeers = new Map<string, string>();
