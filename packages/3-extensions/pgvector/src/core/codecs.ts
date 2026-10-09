@@ -4,10 +4,10 @@
  * Mirrors the patterns in `postgres/codecs-class.ts` and `sqlite/codecs-class.ts` for the single `pg/vector@1` codec. Three artifacts:
  *
  * 1. `PgVectorCodec` extends {@link CodecImpl} with the runtime encode/decode/encodeJson/decodeJson conversions inline. Conversions are simple enough (PostgreSQL `[1,2,3]` text format) that no shared helper module is warranted; the class body is the source of truth.
- * 2. `PgVectorDescriptor` extends {@link PostgresCodecDescriptor} with the codec id, traits, the `pgvector/vector` data type and its params schema, explicit target behavior, and the emit-path `renderOutputType` producing `Vector<${length}>`. The data type declares the type's name and the bounds of `length`.
- * 3. `pgVectorColumn(length)` per-codec column helper invoking `descriptor.factory({ length })` directly.
+ * 2. `PgVectorDescriptor` extends {@link PostgresCodecDescriptor} with the codec id, traits, the `pgvector/vector` data type and its params schema, explicit target behavior, and the emit-path `renderOutputType` producing `Vector` or `Vector<${length}>`. The data type declares the type's name and the bounds of `length`.
+ * 3. `pgVectorColumn(length?)` per-codec column helper invoking `descriptor.factory({ length })` directly.
  *
- * `length` threads into the runtime codec via the constructor so encode/decode/encodeJson/decodeJson enforce the declared dimension at every ingress path. Without this, `vector(3)` and `vector(1536)` would produce codecs with identical behaviour and a dimension-mismatched value would round-trip undetected.
+ * When provided, `length` threads into the runtime codec via the constructor so encode/decode/encodeJson/decodeJson enforce the declared dimension at every ingress path. Without this, `vector(3)` and `vector(1536)` would produce codecs with identical behaviour and a dimension-mismatched value would round-trip undetected.
  */
 
 import type { JsonValue } from '@internal/contract/types';
@@ -35,7 +35,7 @@ import { pgVectorError } from './errors';
 
 type VectorConversionCode = 'RUNTIME.ENCODE_FAILED' | 'RUNTIME.DECODE_FAILED';
 
-type VectorParams = { readonly length: number };
+type VectorParams = { readonly length?: number };
 
 function parseVector(value: string): number[] {
   if (!value.startsWith('[') || !value.endsWith(']')) {
@@ -73,9 +73,9 @@ export class PgVectorCodec extends CodecImpl<
   string,
   number[]
 > {
-  readonly length: number;
+  readonly length: number | undefined;
 
-  constructor(descriptor: AnyCodecDescriptor, length: number) {
+  constructor(descriptor: AnyCodecDescriptor, length: number | undefined) {
     super(descriptor);
     this.length = length;
   }
@@ -93,7 +93,7 @@ export class PgVectorCodec extends CodecImpl<
         throw pgVectorError(code, 'Vector value must contain only finite numbers', { meta });
       }
     }
-    if (value.length !== this.length) {
+    if (this.length !== undefined && value.length !== this.length) {
       throw pgVectorError(
         code,
         `Vector length mismatch: expected ${this.length}, got ${value.length}`,
@@ -127,7 +127,8 @@ export class PgVectorCodec extends CodecImpl<
   }
 
   decodeJson(json: JsonValue): number[] {
-    if (!Array.isArray(json) || json.length !== this.length) return this.refuseJson(json);
+    if (!Array.isArray(json) || (this.length !== undefined && json.length !== this.length))
+      return this.refuseJson(json);
     const numbers: number[] = [];
     for (const element of json) {
       if (typeof element !== 'number' || !Number.isFinite(element)) return this.refuseJson(json);
@@ -139,7 +140,9 @@ export class PgVectorCodec extends CodecImpl<
   private refuseJson(json: JsonValue): never {
     return refuseJsonValue(
       VECTOR_CODEC_ID,
-      `an array of ${counted(this.length, 'finite number')}`,
+      this.length === undefined
+        ? 'an array of finite numbers'
+        : `an array of ${counted(this.length, 'finite number')}`,
       json,
     );
   }
@@ -174,7 +177,7 @@ export class PgVectorDescriptor extends PostgresCodecDescriptor<VectorParams> {
   override readonly traits = ['equality'] as const;
   override readonly paramsSchema: StandardSchemaV1<VectorParams> = pgvectorVectorParams;
   override renderOutputType(params: VectorParams): string {
-    return `Vector<${params.length}>`;
+    return params.length === undefined ? 'Vector' : `Vector<${params.length}>`;
   }
   override factory(params: VectorParams): (ctx: CodecInstanceContext) => PgVectorCodec {
     return () => new PgVectorCodec(this, params.length);
@@ -183,11 +186,21 @@ export class PgVectorDescriptor extends PostgresCodecDescriptor<VectorParams> {
 
 export const pgVectorDescriptor = new PgVectorDescriptor();
 
-/**
- * Per-codec column helper for `pg/vector@1`. Generic over `N extends number` so the column site preserves the dimension literal in `typeParams` (e.g. `pgVectorColumn(1536)` packs `typeParams: { length: 1536 }`).
- */
-export const pgVectorColumn = <N extends number>(length: N) =>
-  column(pgVectorDescriptor.factory({ length }), pgVectorDescriptor.codecId, { length });
+export function pgVectorColumn(): ReturnType<typeof variableVectorColumn>;
+export function pgVectorColumn<N extends number>(
+  length: N,
+): ReturnType<typeof fixedVectorColumn<N>>;
+export function pgVectorColumn(length?: number) {
+  return length === undefined ? variableVectorColumn() : fixedVectorColumn(length);
+}
+
+function variableVectorColumn() {
+  return column(pgVectorDescriptor.factory({}), pgVectorDescriptor.codecId, {});
+}
+
+function fixedVectorColumn<N extends number>(length: N) {
+  return column(pgVectorDescriptor.factory({ length }), pgVectorDescriptor.codecId, { length });
+}
 
 pgVectorColumn satisfies ColumnHelperFor<PgVectorDescriptor>;
 pgVectorColumn satisfies ColumnHelperForStrict<PgVectorDescriptor>;
